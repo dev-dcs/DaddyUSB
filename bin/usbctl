@@ -1,0 +1,371 @@
+#!/system/bin/sh
+# usbctl - small CLI the WebUI (and action.sh) talk to. Prints JSON for
+# anything the UI needs to parse.
+#
+# USB Manager (root edition) - @Dev_DcS
+
+if [ -z "$USBMGR_SH" ]; then
+  for _bb in /data/adb/magisk/busybox /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox; do
+    [ -x "$_bb" ] && USBMGR_SH=$_bb ASH_STANDALONE=1 exec "$_bb" sh "$0" "$@"
+  done
+  USBMGR_SH=system
+  export USBMGR_SH
+fi
+
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/bin}
+# shellcheck source=common.sh
+. "$MODDIR/common.sh"
+
+mkdir -p "$RUN" 2>/dev/null
+
+jerr() {
+  printf '{"ok":false,"error":"%s"}\n' "$1"
+  exit 1
+}
+
+jbool() { [ "$1" = 1 ] || [ "$1" = true ] && echo true || echo false; }
+
+# serialise anything that flips USB functions, double taps happen
+lock_take() {
+  _n=0
+  while ! mkdir "$RUN/apply.lock" 2>/dev/null; do
+    _n=$((_n + 1))
+    if [ "$_n" -ge 20 ]; then
+      # stale lock from a killed shell, take it over
+      rm -rf "$RUN/apply.lock"
+      mkdir "$RUN/apply.lock" 2>/dev/null
+      break
+    fi
+    sleep 1
+  done
+}
+lock_drop() { rmdir "$RUN/apply.lock" 2>/dev/null; }
+
+check_mode_adb() {
+  is_mode "$1" || jerr "bad mode: $1"
+  case $2 in 0 | 1) ;; *) jerr "adb must be 0 or 1" ;; esac
+}
+
+cmd_status() {
+  conf_load
+  usb_backend_init
+  usb_dump
+  adb_get
+  _daemon=false
+  _pid=
+  daemon_pid && _daemon=true && _pid=$DPID
+  sess_id=0
+  sess_state=none
+  [ -r "$SESSION" ] && read -r sess_id sess_state <"$SESSION"
+  case $sess_id in '' | *[!0-9]*) sess_id=0 ;; esac
+  _cable=none
+  if host_mode; then
+    _cable=host
+  elif gadget_up; then
+    _cable=pc
+  fi
+  _host=
+  [ -r "$RUN/ui_host" ] && read -r _host <"$RUN/ui_host"
+  [ -n "$_host" ] || _host=$(ui_pick)
+  _dnd=0
+  [ "$cfg_dnd" = 1 ] && _dnd=1
+  printf '{"ok":true,"version":"%s","daemon":%s,"pid":"%s","session":{"id":%s,"state":"%s"},' \
+    "$(mod_version)" "$_daemon" "$_pid" "$sess_id" "${sess_state:-none}"
+  printf '"cable":"%s","backend":"%s","functions":"%s","applied":"%s","adb":%s,' \
+    "$_cable" "$USB_BACKEND" "${D_FUNCS:-charging}" "$D_APPLIED" "$(jbool "$ADB_NOW")"
+  printf '"locked":"%s","sdk":%s,"root":"%s","host":"%s","enabled":%s,"dnd":%s,' \
+    "$D_LOCKED" "$SDK" "$(root_impl)" "$_host" "$(jbool "$cfg_enabled")" "$(jbool "$_dnd")"
+
+  _block=off
+  _how=
+  [ -r "$BLOCKF" ] && read -r _block _how <"$BLOCKF"
+  _armed=false
+  _left=0
+  if [ -r "$GUARDF" ]; then
+    read -r _dl _ <"$GUARDF"
+    uptime_now
+    _armed=true
+    _left=$((${_dl:-0} - NOW))
+    [ "$_left" -lt 0 ] && _left=0
+  fi
+  printf '"block":"%s","block_how":"%s","kernel":{"deny_usb_gadget":"%s","deny_new_usb":"%s"},' \
+    "${_block:-off}" "$_how" "$(kgate_state "$KGATE_GADGET")" "$(kgate_state "$KGATE_HOST")"
+  printf '"guard":{"enabled":%s,"armed":%s,"left":%s,"timeout":%s,"action":"%s"},' \
+    "$(jbool "$cfg_guard")" "$_armed" "$_left" "$cfg_guard_timeout" "$cfg_guard_action"
+  printf '"peers":['
+  _first=1
+  if [ -r "$PEERF" ]; then
+    while IFS='|' read -r _fp _lbl _str; do
+      is_fp "$_fp" || continue
+      _t=false
+      is_trusted "$_fp" && _t=true
+      [ "$_first" = 1 ] || printf ','
+      printf '{"fp":"%s","label":"%s","strength":"%s","trusted":%s}' "$_fp" "$_lbl" "$_str" "$_t"
+      _first=0
+    done <"$PEERF"
+  fi
+  printf ']}\n'
+}
+
+cmd_config() {
+  conf_load
+  printf '{"ok":true,"enabled":%s,"prompt":%s,"default_mode":"%s","default_adb":%s,' \
+    "$(jbool "$cfg_enabled")" "$(jbool "$cfg_prompt")" "$cfg_default_mode" "$(jbool "$cfg_default_adb")"
+  printf '"adb_off_unplug":%s,"defer_locked":%s,"dnd":%s,"dnd_action":"%s","notify":%s,"ui_host":"%s",' \
+    "$(jbool "$cfg_adb_off_unplug")" "$(jbool "$cfg_defer_locked")" "$(jbool "$cfg_dnd")" \
+    "$cfg_dnd_action" "$(jbool "$cfg_notify")" "$cfg_ui_host"
+  printf '"block":%s,"guard":%s,"guard_timeout":"%s","guard_sticky":%s,"guard_cutoff":%s,"guard_warn":%s,"guard_action":"%s",' \
+    "$(jbool "$cfg_block")" "$(jbool "$cfg_guard")" "$cfg_guard_timeout" "$(jbool "$cfg_guard_sticky")" \
+    "$(jbool "$cfg_guard_cutoff")" "$(jbool "$cfg_guard_warn")" "$cfg_guard_action"
+  printf '"dnd_apps":['
+  _first=1
+  if [ -r "$DND_LIST" ]; then
+    while IFS= read -r _p || [ -n "$_p" ]; do
+      is_pkg "$_p" || continue
+      [ "$_first" = 1 ] || printf ','
+      printf '"%s"' "$_p"
+      _first=0
+    done <"$DND_LIST"
+  fi
+  printf ']}\n'
+}
+
+cmd_set() {
+  conf_load
+  conf_valid "$1" "$2" || jerr "invalid $1=$2"
+  conf_assign "$1" "$2"
+  conf_save || jerr "could not write settings"
+  wake_daemon reload
+  printf '{"ok":true}\n'
+}
+
+cmd_choose() {
+  check_mode_adb "$1" "$2"
+  conf_load
+  if [ "$3" = default ]; then
+    cfg_default_mode=$1
+    cfg_default_adb=$2
+    conf_save
+    wake_daemon reload
+  fi
+  if [ -r "$SESSION" ]; then
+    read -r _sid _st <"$SESSION"
+    echo "$_sid answered" >"$SESSION"
+  fi
+  lock_take
+  apply_cfg "$1" "$2"
+  _rc=$?
+  lock_drop
+  wake_daemon answered
+  # the UI usually closes right away, so let the check finish detached
+  setsid sh "$0" verify "$1" "$2" </dev/null >/dev/null 2>&1 &
+  [ "$_rc" = 0 ] || jerr "apply failed, see log"
+  printf '{"ok":true}\n'
+}
+
+cmd_dismiss() {
+  if [ -r "$SESSION" ]; then
+    read -r _sid _st <"$SESSION"
+    echo "$_sid answered" >"$SESSION"
+    log_msg I "chooser dismissed, leaving USB as it is"
+  fi
+  wake_daemon answered
+  printf '{"ok":true}\n'
+}
+
+cmd_apply() {
+  check_mode_adb "$1" "$2"
+  lock_take
+  apply_cfg "$1" "$2"
+  _rc=$?
+  lock_drop
+  [ "$_rc" = 0 ] || jerr "apply failed, see log"
+  if verify_cfg "$1" "$2" 6; then
+    printf '{"ok":true,"verified":true}\n'
+  else
+    printf '{"ok":true,"verified":false,"functions":"%s","adb":%s}\n' "${D_FUNCS:-charging}" "$(jbool "$ADB_NOW")"
+  fi
+}
+
+cmd_verify() {
+  if verify_cfg "$1" "$2" 8; then
+    log_msg I "confirmed: ${D_FUNCS:-charging}, adb=$ADB_NOW"
+  else
+    log_msg W "framework still reports ${D_FUNCS:-charging} adb=$ADB_NOW (wanted $1 adb=$2)"
+  fi
+}
+
+cmd_prompt() {
+  [ -r "$SESSION" ] || jerr "no computer connected"
+  daemon_pid || jerr "daemon not running"
+  wake_daemon prompt
+  printf '{"ok":true}\n'
+}
+
+cmd_packages() {
+  printf '['
+  pm list packages -3 2>/dev/null | sed -n 's/^package://p' | sort | {
+    _first=1
+    while IFS= read -r _p; do
+      is_pkg "$_p" || continue
+      [ "$_first" = 1 ] || printf ','
+      printf '"%s"' "$_p"
+      _first=0
+    done
+  }
+  printf ']\n'
+}
+
+cmd_dnd() {
+  touch "$DND_LIST"
+  case $1 in
+    add)
+      is_pkg "$2" || jerr "bad package"
+      grep -qxF "$2" "$DND_LIST" || echo "$2" >>"$DND_LIST"
+      ;;
+    del)
+      is_pkg "$2" || jerr "bad package"
+      grep -vxF "$2" "$DND_LIST" >"$DND_LIST.tmp"
+      mv -f "$DND_LIST.tmp" "$DND_LIST"
+      ;;
+    *) jerr "dnd add|del PKG" ;;
+  esac
+  printf '{"ok":true}\n'
+}
+
+# newest first
+cmd_history() {
+  _n=${1:-100}
+  case $_n in '' | *[!0-9]*) _n=100 ;; esac
+  printf '['
+  if [ -r "$HISTORY" ]; then
+    tail -n "$_n" "$HISTORY" | sed -n '1!G;h;$p' | {
+      _first=1
+      while IFS='|' read -r _h _ep _k _fp _lbl _str _tr _res; do
+        is_fp "$_fp" || continue
+        case $_ep in '' | *[!0-9]*) continue ;; esac
+        _t=false
+        is_trusted "$_fp" && _t=true
+        [ "$_first" = 1 ] || printf ','
+        printf '{"id":"%s","t":%s,"kind":"%s","fp":"%s","label":"%s","strength":"%s","trusted_then":%s,"trusted":%s,"result":"%s"}' \
+          "$_h" "$_ep" "$_k" "$_fp" "$_lbl" "$_str" "$(jbool "$_tr")" "$_t" "$_res"
+        _first=0
+      done
+    }
+  fi
+  printf ']\n'
+}
+
+cmd_trusted() {
+  printf '['
+  _first=1
+  if [ -r "$TRUST_LIST" ]; then
+    while IFS='|' read -r _fp _lbl _str; do
+      is_fp "$_fp" || continue
+      [ "$_first" = 1 ] || printf ','
+      printf '{"fp":"%s","label":"%s","strength":"%s"}' "$_fp" "$_lbl" "$_str"
+      _first=0
+    done <"$TRUST_LIST"
+  fi
+  printf ']\n'
+}
+
+# trust FP [strength] [label...]
+cmd_trust() {
+  is_fp "$1" || jerr "bad fingerprint"
+  _fp=$1
+  _str=$2
+  case $_str in unique | model | generic) ;; *) _str=generic ;; esac
+  shift 2 2>/dev/null || shift $#
+  _lbl=$(label_clean "$*")
+  [ -n "$_lbl" ] || _lbl=$_fp
+  if ! is_trusted "$_fp"; then
+    echo "$_fp|$_lbl|$_str" >>"$TRUST_LIST"
+    log_msg I "trusted: $_lbl [$_fp]"
+  fi
+  printf '{"ok":true}\n'
+}
+
+cmd_untrust() {
+  is_fp "$1" || jerr "bad fingerprint"
+  [ -r "$TRUST_LIST" ] || { printf '{"ok":true}\n'; return; }
+  while IFS= read -r _l; do
+    [ "${_l%%|*}" = "$1" ] || printf '%s\n' "$_l"
+  done <"$TRUST_LIST" >"$TRUST_LIST.tmp"
+  mv -f "$TRUST_LIST.tmp" "$TRUST_LIST"
+  log_msg I "untrusted: $1"
+  printf '{"ok":true}\n'
+}
+
+cmd_restart() {
+  if daemon_pid; then
+    kill "$DPID" 2>/dev/null
+    _n=0
+    while [ -d "/proc/$DPID" ] && [ "$_n" -lt 10 ]; do
+      sleep 1
+      _n=$((_n + 1))
+    done
+  fi
+  rm -f "$PIDF"
+  # blank USBMGR_SH so the new daemon picks its busybox again itself
+  USBMGR_SH='' setsid sh "$MODDIR/bin/usbmgrd" </dev/null >/dev/null 2>&1 &
+  sleep 1
+  daemon_pid || jerr "daemon did not come up"
+  printf '{"ok":true,"pid":"%s"}\n' "$DPID"
+}
+
+case $1 in
+  status) cmd_status ;;
+  config) cmd_config ;;
+  set) cmd_set "$2" "$3" ;;
+  choose) cmd_choose "$2" "$3" "$4" ;;
+  dismiss) cmd_dismiss ;;
+  apply) cmd_apply "$2" "$3" ;;
+  verify) cmd_verify "$2" "$3" ;;
+  prompt) cmd_prompt ;;
+  packages) cmd_packages ;;
+  dnd) cmd_dnd "$2" "$3" ;;
+  log)
+    _n=${2:-200}
+    case $_n in *[!0-9]*) _n=200 ;; esac
+    tail -n "$_n" "$LOGF" 2>/dev/null
+    ;;
+  log-clear)
+    : >"$LOGF"
+    rm -f "$LOGF.1"
+    printf '{"ok":true}\n'
+    ;;
+  history) cmd_history "$2" ;;
+  history-clear)
+    : >"$HISTORY"
+    printf '{"ok":true}\n'
+    ;;
+  trusted) cmd_trusted ;;
+  trust)
+    shift
+    cmd_trust "$@"
+    ;;
+  untrust) cmd_untrust "$2" ;;
+  block)
+    case $2 in
+      on) cmd_set block 1 ;;
+      off) cmd_set block 0 ;;
+      *) jerr "block on|off" ;;
+    esac
+    ;;
+  restart) cmd_restart ;;
+  version) mod_version ;;
+  *)
+    cat <<EOF
+usage: usbctl <command>
+  status | config | set KEY VALUE
+  choose MODE ADB [default] | dismiss | apply MODE ADB | prompt
+  packages | dnd add|del PKG
+  block on|off | history [N] | history-clear
+  trusted | trust FP [unique|model|generic] [LABEL] | untrust FP
+  log [N] | log-clear | restart | version
+modes: charging mtp ptp rndis midi    adb: 0|1
+EOF
+    ;;
+esac

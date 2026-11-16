@@ -1,0 +1,630 @@
+#!/system/bin/sh
+# usbmgrd - watches the USB port and decides what happens on it:
+#   - the chooser when a computer picks the phone up
+#   - the USB guard: unknown device + locked phone -> restart unless unlocked in time
+#   - the USB block: no data at all, either way, just power
+# Replaces the system_server hooks of the LSPosed version with plain
+# sysfs/configfs work, so no Xposed framework is involved.
+#
+# USB Manager (root edition) - @Dev_DcS
+
+# prefer the root manager's busybox, its ash behaves the same everywhere
+if [ -z "$USBMGR_SH" ]; then
+  for _bb in /data/adb/magisk/busybox /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox; do
+    [ -x "$_bb" ] && USBMGR_SH=$_bb ASH_STANDALONE=1 exec "$_bb" sh "$0" "$@"
+  done
+  USBMGR_SH=system
+  export USBMGR_SH
+fi
+
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/bin}
+# shellcheck source=common.sh
+. "$MODDIR/common.sh"
+
+run_fresh
+
+if daemon_pid; then
+  echo "usbmgrd already running ($DPID)"
+  exit 0
+fi
+echo $$ >"$PIDF"
+
+rm -f "$SESSION" "$SUPPRESS" "$RUN/ui_host" "$RUN"/*.notified "$RUN"/*.flag "$PEERF" "$GUARDF"
+if [ ! -p "$FIFO" ]; then
+  rm -f "$FIFO"
+  mkfifo "$FIFO" || exit 1
+fi
+# held open read+write: lets `read -t` double as our sleep, and usbctl can
+# poke us awake by writing a line into it
+exec 3<>"$FIFO"
+
+trap 'log_msg I "usbmgrd stopped"; wakelock unlock; rm -f "$PIDF"; exit 0' TERM INT HUP
+
+conf_load
+usb_backend_init
+ps_init
+udc_list
+kgate_init
+# a previous daemon died mid-countdown: those entries never got an outcome
+[ -f "$HISTORY" ] && sed -i -e 's/|armed$/|interrupted/' -e 's/|active$/|interrupted/' "$HISTORY"
+log_rotate
+log_msg I "usbmgrd $(mod_version) up: backend=$USB_BACKEND gadgets=${UDC_LIST:-none} sdk=$SDK root=$(root_impl) sh=$USBMGR_SH"
+log_msg I "kernel switches: deny_usb_gadget=$K_GADGET deny_new_usb=$K_HOST (1 = present)"
+[ "$USB_BACKEND" = dumpsys ] && log_msg W "no udc/android_usb state file, falling back to polling dumpsys usb"
+
+# mksh and busybox ash both have read -t, but if we somehow land in a
+# shell without it, fall back to sleep instead of spinning
+HAVE_RT=0
+read -r -t 0 _x </dev/null 2>/dev/null
+[ $? -le 1 ] && HAVE_RT=1
+
+# All timing is in uptime seconds (boot clock, keeps running in suspend),
+# never loop passes: a burst of wake messages runs the loop several times
+# in the same second.
+
+# chooser session
+sid=0
+state=none
+launched=0
+lock_noted=0
+gone_since=0
+cooldown=0
+last_up=0
+last_try=0
+last_poll=0
+last_rot=0
+
+# whatever is on the other end of the cable
+p_kind=none
+p_id=0
+p_n=0
+p_fps=
+p_hsig=
+p_unknown=0
+p_unlocked=0
+p_downsince=0
+
+# guard + block
+g_armed=0
+g_deadline=0
+g_buzzed=0
+g_lastlock=0
+g_hids=
+g_tags=
+cut_active=0
+block_applied=0
+block_why=
+block_how=
+blk_noted=0
+blk_since=0
+# restarted while something was blocked (usbctl restart, a crash)? Then the
+# kernel is still cut; mark it applied so the first tick re-applies or releases
+if block_leftovers; then
+  block_applied=1
+  block_why=leftover
+fi
+
+# ------------------------------------------------------------ chooser
+
+session_set() {
+  state=$1
+  echo "$sid $state" >"$SESSION"
+}
+
+session_start() {
+  sid=$NOW
+  gone_since=0
+  last_try=$NOW
+  launched=0
+  lock_noted=0
+  probe_phys
+  log_msg I "computer connected (tc=$TRUST_TC ps=$TRUST_PS)"
+
+  if [ "$cfg_dnd" = 1 ] && [ -s "$DND_LIST" ]; then
+    _fg=$(foreground_pkg)
+    if [ -n "$_fg" ] && grep -qxF "$_fg" "$DND_LIST" 2>/dev/null; then
+      if [ "$cfg_dnd_action" = default ]; then
+        _m=$cfg_default_mode
+        _a=$cfg_default_adb
+      else
+        _m=charging
+        _a=0
+      fi
+      log_msg I "$_fg is in front (game mode), no prompt -> $_m adb=$_a"
+      session_set dnd
+      apply_cfg "$_m" "$_a"
+      return
+    fi
+  fi
+
+  if [ "$cfg_prompt" != 1 ]; then
+    session_set auto
+    apply_cfg "$cfg_default_mode" "$cfg_default_adb"
+    return
+  fi
+
+  session_set pending
+  try_launch
+}
+
+try_launch() {
+  if [ "$cfg_defer_locked" = 1 ] && is_locked; then
+    if [ "$lock_noted" = 0 ]; then
+      log_msg I "locked, chooser waits for unlock"
+      lock_noted=1
+    fi
+    return 1
+  fi
+  if launch_ui; then
+    launched=1
+    log_msg I "chooser opened in $UI_HOST"
+    return 0
+  fi
+  log_msg W "no WebUI host could be opened, applying the default config"
+  session_set auto
+  apply_cfg "$cfg_default_mode" "$cfg_default_adb"
+  notify_nohost
+  return 1
+}
+
+session_end() {
+  if [ "$1" != quiet ]; then
+    log_msg I "computer disconnected"
+    if [ "$cfg_adb_off_unplug" = 1 ]; then
+      adb_get
+      if [ "$ADB_NOW" = 1 ]; then
+        settings put global adb_enabled 0 >/dev/null 2>&1 && log_msg I "adb off after unplug"
+      fi
+    fi
+  fi
+  rm -f "$SESSION"
+  sid=0
+  state=none
+  cooldown=$((NOW + 2))
+}
+
+session_check_gone() {
+  [ "$gone_since" = 0 ] && gone_since=$NOW
+  _gone=$((NOW - gone_since))
+  phys_attached
+  _pa=$?
+  # cable physically out: no point waiting on anything
+  if [ "$_pa" = 1 ]; then
+    [ "$_gone" -ge 1 ] && session_end
+    return 0
+  fi
+  # otherwise give our own re-enumeration a chance to finish first
+  if [ -r "$SUPPRESS" ]; then
+    read -r _until <"$SUPPRESS"
+    [ "${_until:-0}" -gt "$NOW" ] 2>/dev/null && return 0
+  fi
+  if [ "$_pa" = 0 ]; then
+    # still plugged, host just went quiet (PC asleep / shut down)
+    [ "$_gone" -ge 15 ] || return 0
+  else
+    [ "$_gone" -ge 3 ] || return 0
+  fi
+  session_end
+}
+
+session_tick() {
+  # usbctl rewrites the session file once the user picks something
+  if [ "$state" = pending ] && [ -r "$SESSION" ]; then
+    read -r _fsid _fstate <"$SESSION"
+    [ "$_fsid" = "$sid" ] && [ -n "$_fstate" ] && state=$_fstate
+  fi
+  if [ "$state" = pending ] && [ "$launched" = 0 ] && [ $((NOW - last_try)) -ge 2 ]; then
+    last_try=$NOW
+    try_launch
+  fi
+  return 0
+}
+
+chooser_tick() {
+  if [ "$sid" = 0 ]; then
+    if [ "$up" = 1 ] && [ "$NOW" -ge "$cooldown" ]; then
+      session_start
+    fi
+    return 0
+  fi
+  if [ "$up" = 1 ]; then
+    gone_since=0
+  else
+    session_check_gone
+  fi
+  [ "$sid" != 0 ] && session_tick
+  return 0
+}
+
+# ------------------------------------------------------------ peers
+
+# the gadget is down but was a computer a moment ago - still there?
+pc_still_there() {
+  phys_attached
+  case $? in
+    0)
+      p_downsince=0
+      return 0
+      ;;
+    1) return 1 ;;
+  esac
+  # hardware can't tell us. If we're the ones holding the link down, assume yes
+  [ "$block_applied" = 1 ] && return 0
+  [ "$p_downsince" = 0 ] && p_downsince=$NOW
+  [ $((NOW - p_downsince)) -lt 3 ]
+}
+
+# log every fingerprint once per attach, note whether any is unknown
+peer_record() {
+  while IFS='|' read -r _fp _lbl _str; do
+    [ -n "$_fp" ] || continue
+    case "
+$p_fps
+" in *"
+$_fp
+"*) continue ;; esac
+    p_fps="$p_fps
+$_fp"
+    p_n=$((p_n + 1))
+    if is_trusted "$_fp"; then
+      _tr=1
+      _res=trusted
+    else
+      _tr=0
+      _res=active
+      p_unknown=1
+    fi
+    if [ "$cfg_block" = 1 ]; then
+      _res=blocked
+      _lbl="$_lbl, data blocked"
+    fi
+    history_add "$p_id.$p_n" "$p_id" "$p_kind" "$_fp" "$_lbl" "$_str" "$_tr" "$_res"
+    echo "$_fp|$_lbl|$_str" >>"$PEERF"
+    log_msg I "peer: $_lbl [$_fp] trusted=$_tr"
+  done <<EOF
+$1
+EOF
+}
+
+peer_new() {
+  p_kind=$1
+  p_id=$(date +%s)
+  p_n=0
+  p_fps=
+  p_unknown=0
+  p_downsince=0
+  p_hsig=$HSIG
+  : >"$PEERF"
+  [ "$1" = pc ] && probe_phys
+  if is_locked; then p_unlocked=0; else p_unlocked=1; fi
+  if [ "$1" = pc ]; then
+    peer_record "$(pc_fingerprint)"
+  else
+    _l=$(host_devices)
+    # deny_new_usb stops it before it ever has an ID
+    [ -n "$_l" ] || _l="usb:denied|USB device refused by the kernel|generic"
+    peer_record "$_l"
+  fi
+  guard_consider
+}
+
+# devices came or went on a hub while we're the host
+peer_more() {
+  p_hsig=$HSIG
+  _was=$p_unknown
+  peer_record "$(host_devices)"
+  if [ "$g_armed" = 1 ]; then
+    history_set "$p_id" armed
+  elif [ "$p_unknown" = 1 ] && [ "$_was" = 0 ]; then
+    guard_consider
+  fi
+}
+
+peer_gone() {
+  log_msg I "peer gone ($p_kind)"
+  if [ "$g_armed" = 1 ] && [ "$cfg_guard_sticky" != 1 ]; then
+    guard_disarm unplugged
+  fi
+  p_kind=none
+  p_id=0
+  p_fps=
+  rm -f "$PEERF"
+}
+
+peer_tick() {
+  _k=none
+  HSIG=
+  if host_mode; then
+    host_sig
+    if [ -n "$HSIG" ]; then
+      _k=usb
+    elif [ -f "$RUN/khost.set" ] && phys_now; then
+      # something wants us as host and the kernel refused it
+      _k=usb
+    fi
+  elif [ "$up" = 1 ]; then
+    _k=pc
+    p_downsince=0
+  elif [ "$p_kind" = pc ]; then
+    pc_still_there && _k=pc
+  elif [ "$block_applied" = 1 ] && phys_now && looks_like_data_host; then
+    # nothing can enumerate while blocked, BC1.2 is all we get
+    _k=pc
+  fi
+
+  if [ "$_k" != "$p_kind" ]; then
+    [ "$p_kind" != none ] && peer_gone
+    [ "$_k" != none ] && peer_new "$_k"
+  elif [ "$_k" = usb ] && [ "$HSIG" != "$p_hsig" ]; then
+    peer_more
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------ guard
+
+guard_consider() {
+  # trusted (or blocked) lines were already closed by peer_record
+  [ "$p_unknown" = 1 ] || return 0
+  [ "$cfg_block" = 1 ] && return 0
+  if [ "$cfg_guard" != 1 ]; then
+    history_set "$p_id" logged
+    return 0
+  fi
+  if [ "$p_unlocked" = 1 ]; then
+    history_set "$p_id" open
+    return 0
+  fi
+  if ! ce_unlocked; then
+    history_set "$p_id" bfu
+    log_msg I "guard: still before first unlock, data is encrypted already, not arming"
+    return 0
+  fi
+  guard_arm
+}
+
+guard_arm() {
+  g_hids="$g_hids $p_id"
+  history_set "$p_id" armed
+  if [ "$g_armed" = 1 ]; then
+    log_msg W "guard: another unknown device while armed, deadline stays"
+    return 0
+  fi
+  g_armed=1
+  g_deadline=$((NOW + cfg_guard_timeout))
+  g_buzzed=0
+  g_lastlock=$NOW
+  wakelock lock
+  echo "$g_deadline $cfg_guard_timeout" >"$GUARDF"
+  [ "$cfg_guard_cutoff" = 1 ] && cut_active=1
+  log_msg W "guard ARMED: unknown $p_kind while locked, restart in ${cfg_guard_timeout}s unless unlocked (cutoff=$cfg_guard_cutoff action=$cfg_guard_action)"
+  if [ "$cfg_guard_warn" = 1 ]; then
+    g_tags="$g_tags usbguard_$p_id"
+    notify_post "usbguard_$p_id" "USB guard" \
+      "Unknown USB device connected while locked. Unlock within ${cfg_guard_timeout}s or the phone restarts."
+    buzz 150
+  fi
+}
+
+guard_reset() {
+  for _t in $g_tags; do notify_hide "$_t"; done
+  g_armed=0
+  g_hids=
+  g_tags=
+  cut_active=0
+  rm -f "$GUARDF"
+  wakelock unlock
+}
+
+guard_disarm() {
+  for _h in $g_hids; do history_set "$_h" "$1"; done
+  log_msg I "guard disarmed: $1"
+  guard_reset
+}
+
+guard_fire() {
+  if [ "$cfg_guard_action" = test ]; then
+    for _h in $g_hids; do history_set "$_h" test; done
+    log_msg W "guard (test mode): not unlocked in ${cfg_guard_timeout}s, a real run would restart now"
+    guard_reset
+    notify_post "usbguard_test_$NOW" "USB guard test" \
+      "Not unlocked in time. With test mode off the phone would have restarted."
+    buzz 600
+    # same attach shouldn't arm again
+    p_unlocked=1
+    return 0
+  fi
+  for _h in $g_hids; do history_set "$_h" rebooted; done
+  log_msg W "guard: not unlocked within ${cfg_guard_timeout}s of an unknown USB device, restarting"
+  do_reboot
+  # init takes it from here; if not, the next tick fires again
+  sleep 20
+}
+
+guard_tick() {
+  [ "$g_armed" = 1 ] || return 0
+  if [ "$cfg_guard" != 1 ]; then
+    guard_disarm cancelled
+    return 0
+  fi
+  if [ $((NOW - g_lastlock)) -ge 2 ]; then
+    g_lastlock=$NOW
+    if ! is_locked; then
+      guard_disarm unlocked
+      p_unlocked=1
+      return 0
+    fi
+  fi
+  _left=$((g_deadline - NOW))
+  if [ "$_left" -le 10 ] && [ "$g_buzzed" = 0 ]; then
+    g_buzzed=1
+    [ "$cfg_guard_warn" = 1 ] && buzz 600
+  fi
+  [ "$_left" -le 0 ] && guard_fire
+  return 0
+}
+
+# ------------------------------------------------------------ block
+
+block_set() {
+  if [ "$1" = 1 ]; then
+    if [ "$cfg_block" = 1 ]; then
+      block_why=switch
+      # ADB off first, otherwise Android restarts the gadget right after we cut it
+      adb_get
+      if [ "$ADB_NOW" = 1 ]; then
+        settings put global adb_enabled 0 >/dev/null 2>&1
+        sleep 1
+      fi
+      [ "$sid" != 0 ] && session_end quiet
+    else
+      block_why=guard
+    fi
+    kgate_set 1
+    if [ -f "$RUN/kgadget.set" ]; then
+      block_how=kernel
+    else
+      # stock kernel: take the gadget off the controller instead
+      gadget_cut
+      block_how=userspace
+    fi
+    host_param_cut
+    host_enforce
+    block_applied=1
+    blk_since=$NOW
+    echo "$block_why $block_how" >"$BLOCKF"
+    log_msg I "USB data blocked ($block_why, $block_how)"
+  else
+    kgate_set 0
+    gadget_restore
+    host_restore
+    block_applied=0
+    block_why=
+    block_how=
+    rm -f "$BLOCKF"
+    log_msg I "USB data unblocked"
+  fi
+}
+
+block_tick() {
+  _want=0
+  _why=
+  if [ "$cfg_block" = 1 ]; then
+    _want=1
+    _why=switch
+  elif [ "$cut_active" = 1 ]; then
+    _want=1
+    _why=guard
+  fi
+  if [ "$_want" = 1 ] && [ "$block_why" = leftover ]; then
+    block_set 1
+  elif [ "$_want" != "$block_applied" ]; then
+    block_set "$_want"
+  elif [ "$_want" = 1 ] && [ "$_why" != "$block_why" ]; then
+    block_why=$_why
+    echo "$block_why $block_how" >"$BLOCKF"
+  fi
+  [ "$block_applied" = 1 ] || return 0
+  [ -n "$UDC_LIST" ] || udc_list
+
+  if kgate_enforce && [ $((NOW - blk_noted)) -ge 60 ]; then
+    log_msg W "a kernel USB switch got cleared behind our back, set it again"
+    blk_noted=$NOW
+  fi
+
+  if [ -f "$RUN/kgadget.set" ]; then
+    # The kernel keeps the pullup down, re-binds can't get past it. Only
+    # step in if a host somehow got through anyway (the disconnect itself
+    # runs from a workqueue, so give it a couple of seconds first).
+    if [ $((NOW - blk_since)) -ge 2 ] && [ -n "$USB_STATE_FILE" ] && gadget_up && gadget_cut; then
+      log_msg W "link came up despite deny_usb_gadget, unbinding the gadget as well"
+    fi
+  elif gadget_cut; then
+    # Stock kernel: Android (or its gadget HAL) re-binds on its own now and
+    # then - function changes, ADB flipped back on, a reconnect. Cut again.
+    if [ $((NOW - blk_noted)) -ge 60 ]; then
+      log_msg W "gadget was re-bound, cut again"
+      blk_noted=$NOW
+    fi
+    if [ "$cfg_block" = 1 ]; then
+      adb_get
+      [ "$ADB_NOW" = 1 ] && settings put global adb_enabled 0 >/dev/null 2>&1
+    fi
+  fi
+  [ -n "$HSIG" ] && host_enforce
+  # whatever we saw this second is going away
+  up=0
+  return 0
+}
+
+# ------------------------------------------------------------ main loop
+
+while :; do
+  _msg=
+  if [ "$HAVE_RT" = 1 ]; then
+    read -r -t 1 _msg <&3
+  else
+    sleep 1
+  fi
+  uptime_now
+
+  # what was asked is in the flag files, the FIFO line only woke us up
+  if [ -f "$RUN/reload.flag" ]; then
+    rm -f "$RUN/reload.flag"
+    conf_load
+    log_msg I "settings reloaded"
+  fi
+  if [ -f "$RUN/rescan.flag" ]; then
+    rm -f "$RUN/rescan.flag"
+    usb_backend_init
+    ps_init
+    udc_list
+    log_msg I "rescanned: backend=$USB_BACKEND gadgets=${UDC_LIST:-none}"
+  fi
+  if [ -f "$RUN/prompt.flag" ]; then
+    rm -f "$RUN/prompt.flag"
+    # user asked to see the chooser again (action button / WebUI)
+    if [ "$sid" != 0 ]; then
+      session_set pending
+      launched=0
+      lock_noted=0
+      last_try=0
+    fi
+  fi
+
+  # module disabled in the manager: put everything back and idle
+  if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
+    [ "$g_armed" = 1 ] && guard_disarm cancelled
+    [ "$block_applied" = 1 ] && block_set 0
+    [ "$sid" != 0 ] && session_end quiet
+    [ "$p_kind" != none ] && peer_gone
+    continue
+  fi
+
+  # dumpsys is way heavier than a sysfs read, only every third second
+  if [ "$USB_BACKEND" = dumpsys ] && [ $((NOW - last_poll)) -lt 3 ]; then
+    up=$last_up
+  else
+    last_poll=$NOW
+    if gadget_up && ! host_mode; then up=1; else up=0; fi
+  fi
+  [ "$block_applied" = 1 ] && up=0
+  last_up=$up
+
+  # order matters: the guard decides first so a cut lands in this same second
+  peer_tick
+  guard_tick
+  block_tick
+
+  if [ "$cfg_enabled" = 1 ] && [ "$block_applied" = 0 ]; then
+    chooser_tick
+  elif [ "$cfg_enabled" != 1 ] && [ "$sid" != 0 ]; then
+    session_end quiet
+  fi
+
+  if [ $((NOW - last_rot)) -ge 900 ]; then
+    last_rot=$NOW
+    log_rotate
+  fi
+done

@@ -1,0 +1,6 @@
+id=usbmanager_dcs
+name=USB Manager (no LSPosed)
+version=v1.2.0
+versionCode=120
+author=@Dev_DcS
+description=Asks what to do every time you plug into a computer (USB mode + ADB per connection). USB guard: restarts the phone if an unknown device is connected while locked and it is not unlocked in time. Optional full USB data block, enforced in the kernel on the dev-dcs GKI builds. No Xposed needed.

@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>USB Manager</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top">
+  <h1>USB Manager</h1>
+  <span id="daemon-pill" class="pill">…</span>
+</header>
+
+<main>
+  <!-- status -->
+  <section id="view-status" class="view active">
+    <div class="card hero" id="conn-card">
+      <div class="hero-icon" id="conn-icon"></div>
+      <div>
+        <div class="hero-title" id="conn-title">Checking…</div>
+        <div class="hero-sub" id="conn-sub"></div>
+      </div>
+    </div>
+
+    <div class="card banner bad" id="guard-banner" hidden>
+      <b>USB guard armed</b>
+      <span id="guard-banner-text"></span>
+    </div>
+    <div class="card banner" id="block-banner" hidden>
+      <b>USB data is blocked</b>
+      <span id="block-banner-text"></span>
+    </div>
+
+    <div class="card">
+      <div class="row"><span>USB mode</span><b id="st-mode">-</b></div>
+      <div class="row"><span>USB debugging</span><b id="st-adb">-</b></div>
+      <div class="row"><span>Chooser</span><b id="st-session">-</b></div>
+      <div class="row"><span>Other end</span><b id="st-peer">-</b></div>
+    </div>
+
+    <div class="card">
+      <h2>Change it now</h2>
+      <div class="chips" id="live-modes"></div>
+      <label class="switch-row">
+        <span>USB debugging (ADB)</span>
+        <input type="checkbox" id="live-adb"><i class="sw"></i>
+      </label>
+      <button class="btn primary wide" id="live-apply">Apply</button>
+      <p class="hint" id="live-result"></p>
+    </div>
+
+    <div class="card small">
+      <div class="row"><span>Detection</span><code id="st-backend">-</code></div>
+      <div class="row"><span>Kernel USB switches</span><code id="st-kgate">-</code></div>
+      <div class="row"><span>Root</span><code id="st-root">-</code></div>
+      <div class="row"><span>WebUI host</span><code id="st-host">-</code></div>
+      <div class="row"><span>Android SDK</span><code id="st-sdk">-</code></div>
+      <div class="row"><span>Version</span><code id="st-ver">-</code></div>
+    </div>
+  </section>
+
+  <!-- settings -->
+  <section id="view-settings" class="view">
+    <div class="card">
+      <label class="switch-row">
+        <span>Connection chooser<small>Off = no prompt and no ADB handling. Guard and block keep working</small></span>
+        <input type="checkbox" data-key="enabled"><i class="sw"></i>
+      </label>
+      <label class="switch-row">
+        <span>Ask on every connection<small>Off = silently apply the default below</small></span>
+        <input type="checkbox" data-key="prompt"><i class="sw"></i>
+      </label>
+      <label class="switch-row">
+        <span>Turn ADB off on unplug<small>adbd goes down as soon as the cable is out</small></span>
+        <input type="checkbox" data-key="adb_off_unplug"><i class="sw"></i>
+      </label>
+      <label class="switch-row">
+        <span>Wait for unlock<small>Hold the chooser until the secure lock screen is gone</small></span>
+        <input type="checkbox" data-key="defer_locked"><i class="sw"></i>
+      </label>
+      <label class="switch-row">
+        <span>Notifications<small>Only used when no WebUI app is around</small></span>
+        <input type="checkbox" data-key="notify"><i class="sw"></i>
+      </label>
+    </div>
+
+    <div class="card">
+      <h2>Default config</h2>
+      <p class="hint">Pre-selected in the chooser, and used when asking is off.</p>
+      <label class="field">
+        <span>USB mode</span>
+        <select data-key="default_mode" id="default-mode"></select>
+      </label>
+      <label class="switch-row">
+        <span>USB debugging (ADB)</span>
+        <input type="checkbox" data-key="default_adb"><i class="sw"></i>
+      </label>
+    </div>
+
+    <div class="card">
+      <h2>WebUI host</h2>
+      <p class="hint">Leave on <code>auto</code> unless your manager uses a renamed package.
+        Format: <code>package/.ActivityName</code></p>
+      <div class="inline">
+        <input type="text" id="ui-host" spellcheck="false" autocapitalize="off" placeholder="auto">
+        <button class="btn" id="ui-host-save">Save</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Daemon</h2>
+      <button class="btn wide" id="restart">Restart daemon</button>
+    </div>
+
+    <p class="credits">
+      Root module edition by @Dev_DcS. Idea and original LSPosed module:
+      USBManager by TigerSpirit217.
+    </p>
+  </section>
+
+  <!-- security -->
+  <section id="view-security" class="view">
+    <div class="card">
+      <label class="switch-row">
+        <span>Block all USB data<small>Charging only, in both directions. Computers see nothing, USB sticks and keyboards get no driver, ADB stays off</small></span>
+        <input type="checkbox" data-key="block" data-confirm="block"><i class="sw"></i>
+      </label>
+      <p class="hint">Charging from a computer can be slower while this is on. Survives reboots.</p>
+      <p class="hint" id="kgate-hint"></p>
+    </div>
+
+    <div class="card">
+      <label class="switch-row">
+        <span>USB guard<small>Restart the phone if an unknown USB device is connected while it's locked and it isn't unlocked in time</small></span>
+        <input type="checkbox" data-key="guard" data-confirm="guard"><i class="sw"></i>
+      </label>
+      <label class="field">
+        <span>Time to unlock</span>
+        <select data-key="guard_timeout">
+          <option value="15">15 seconds</option>
+          <option value="30">30 seconds</option>
+          <option value="45">45 seconds</option>
+          <option value="60">1 minute</option>
+          <option value="90">90 seconds</option>
+          <option value="120">2 minutes</option>
+          <option value="180">3 minutes</option>
+          <option value="300">5 minutes</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>When time runs out</span>
+        <select data-key="guard_action">
+          <option value="reboot">Restart the phone</option>
+          <option value="test">Test mode (log + notify only)</option>
+        </select>
+      </label>
+      <label class="switch-row">
+        <span>Cut data right away<small>The device loses USB data the moment the countdown starts, back after unlock</small></span>
+        <input type="checkbox" data-key="guard_cutoff"><i class="sw"></i>
+      </label>
+      <label class="switch-row">
+        <span>Keep counting after unplug<small>Pulling the cable doesn't stop the countdown, only unlocking does</small></span>
+        <input type="checkbox" data-key="guard_sticky"><i class="sw"></i>
+      </label>
+      <label class="switch-row">
+        <span>Warn on the lock screen<small>Notification when it starts, vibration 10 s before</small></span>
+        <input type="checkbox" data-key="guard_warn"><i class="sw"></i>
+      </label>
+      <p class="hint">Only arms after the first unlock since boot. Before that your data is still encrypted, so a restart wouldn't add anything.</p>
+    </div>
+
+    <div class="card">
+      <h2>Trusted devices</h2>
+      <p class="hint">These never start the countdown.</p>
+      <ul class="applist" id="trust-list"></ul>
+      <p class="hint" id="trust-empty">Nothing trusted yet. Trust devices from the history below or from the chooser.</p>
+    </div>
+
+    <div class="card">
+      <div class="head-row">
+        <h2>History</h2>
+        <button class="btn small" id="hist-clear">Clear</button>
+      </div>
+      <ul class="applist hist" id="hist-list"></ul>
+      <p class="hint" id="hist-empty">No connections recorded yet.</p>
+    </div>
+  </section>
+
+  <!-- game mode -->
+  <section id="view-apps" class="view">
+    <div class="card">
+      <label class="switch-row">
+        <span>Game mode<small>Skip the chooser while one of these apps is in front</small></span>
+        <input type="checkbox" data-key="dnd"><i class="sw"></i>
+      </label>
+      <label class="field">
+        <span>Instead, apply</span>
+        <select data-key="dnd_action">
+          <option value="charging">Charge only, ADB off (recommended)</option>
+          <option value="default">My default config</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="card">
+      <h2>Selected apps</h2>
+      <ul class="applist" id="dnd-list"></ul>
+      <p class="hint" id="dnd-empty">Nothing picked yet.</p>
+    </div>
+
+    <div class="card">
+      <h2>Add apps</h2>
+      <input type="search" id="app-search" placeholder="Search installed apps" spellcheck="false" autocapitalize="off">
+      <ul class="applist" id="app-list"></ul>
+      <button class="btn wide" id="app-load">Load installed apps</button>
+    </div>
+  </section>
+
+  <!-- log -->
+  <section id="view-log" class="view">
+    <div class="card">
+      <div class="inline">
+        <button class="btn" id="log-refresh">Refresh</button>
+        <button class="btn" id="log-clear">Clear</button>
+      </div>
+      <pre id="log-box">…</pre>
+    </div>
+  </section>
+</main>
+
+<nav class="tabs">
+  <button data-view="status" class="on">Status</button>
+  <button data-view="security">Security</button>
+  <button data-view="settings">Settings</button>
+  <button data-view="apps">Games</button>
+  <button data-view="log">Log</button>
+</nav>
+
+<!-- the chooser, shown when a computer is waiting for an answer -->
+<div class="scrim" id="chooser" hidden>
+  <div class="sheet" role="dialog" aria-labelledby="ch-title">
+    <div class="sheet-head">
+      <div class="usb-badge" id="ch-badge"></div>
+      <div>
+        <h2 id="ch-title">Connected to a computer</h2>
+        <p class="hint">What should this connection be used for?</p>
+      </div>
+    </div>
+    <div class="modes" id="ch-modes"></div>
+    <label class="switch-row boxed">
+      <span>USB debugging (ADB)<small>Only for this connection</small></span>
+      <input type="checkbox" id="ch-adb"><i class="sw"></i>
+    </label>
+    <label class="check-row">
+      <input type="checkbox" id="ch-default">
+      <span>Make this my default</span>
+    </label>
+    <label class="check-row" id="ch-trust-row" hidden>
+      <input type="checkbox" id="ch-trust">
+      <span>Trust this computer for the USB guard<small id="ch-trust-hint"></small></span>
+    </label>
+    <div class="sheet-actions">
+      <button class="btn" id="ch-later">Not now</button>
+      <button class="btn primary" id="ch-ok">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- confirm dialog -->
+<div class="scrim center" id="ask" hidden>
+  <div class="dialog" role="alertdialog" aria-labelledby="ask-title">
+    <h2 id="ask-title"></h2>
+    <p id="ask-text"></p>
+    <div class="sheet-actions">
+      <button class="btn" id="ask-no">Cancel</button>
+      <button class="btn primary" id="ask-yes">OK</button>
+    </div>
+  </div>
+</div>
+
+<div class="snack" id="snack"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
