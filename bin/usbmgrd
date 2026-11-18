@@ -51,6 +51,7 @@ kgate_init
 log_rotate
 log_msg I "usbmgrd $(mod_version) up: backend=$USB_BACKEND gadgets=${UDC_LIST:-none} sdk=$SDK root=$(root_impl) sh=$USBMGR_SH"
 log_msg I "kernel switches: deny_usb_gadget=$K_GADGET deny_new_usb=$K_HOST (1 = present)"
+[ "$cfg_idle_reboot" = 1 ] && log_msg I "auto restart on: ${cfg_idle_minutes} min without unlock, clean_cache=$cfg_clean_cache"
 [ "$USB_BACKEND" = dumpsys ] && log_msg W "no udc/android_usb state file, falling back to polling dumpsys usb"
 
 # mksh and busybox ash both have read -t, but if we somehow land in a
@@ -104,6 +105,18 @@ if block_leftovers; then
   block_applied=1
   block_why=leftover
 fi
+
+# auto restart: when did we last see the phone unlocked? Kept in run/ so a
+# daemon restart doesn't reset the clock (run_fresh drops it on a new boot)
+i_on=$cfg_idle_reboot
+i_afu=0
+i_last=0
+i_next=0
+i_hold=0
+i_saved=0
+[ -r "$IDLEF" ] && read -r i_last _ <"$IDLEF"
+case $i_last in '' | *[!0-9]*) i_last=0 ;; esac
+[ "$i_last" != 0 ] && i_afu=1 && i_saved=$i_last
 
 # ------------------------------------------------------------ chooser
 
@@ -437,6 +450,8 @@ guard_fire() {
   fi
   for _h in $g_hids; do history_set "$_h" rebooted; done
   log_msg W "guard: not unlocked within ${cfg_guard_timeout}s of an unknown USB device, restarting"
+  # data is already cut if cutoff is on, so a short cleanup is fine here
+  [ "$cfg_clean_cache" = 1 ] && clean_caches 20
   do_reboot
   # init takes it from here; if not, the next tick fires again
   sleep 20
@@ -558,6 +573,87 @@ block_tick() {
   return 0
 }
 
+# ------------------------------------------------------------ auto restart
+
+idle_seen_unlocked() {
+  i_last=$NOW
+  # no need to hit the disk every 5 s while the phone is in use, but the
+  # first one always goes out (0 = nothing saved yet this boot)
+  if [ "$i_saved" = 0 ] || [ $((NOW - i_saved)) -ge 300 ]; then
+    echo "$i_last" >"$IDLEF"
+    i_saved=$NOW
+  fi
+}
+
+idle_fire() {
+  _h=$(((NOW - i_last) / 3600))
+  _m=$((((NOW - i_last) % 3600) / 60))
+  log_msg W "auto restart: not unlocked for ${_h}h${_m}m (limit ${cfg_idle_minutes} min), restarting"
+  wakelock lock
+  [ "$cfg_clean_cache" = 1 ] && clean_caches 60
+  rm -f "$IDLEF"
+  do_reboot
+  sleep 20
+}
+
+# Lock state only gets checked while the screen is on: that's the only time
+# anyone can unlock, and it keeps dumpsys out of the screen-off path. The
+# loop doesn't run in deep sleep, so the restart lands on the first wake
+# after the deadline (the boot clock keeps counting while suspended).
+idle_tick() {
+  if [ "$cfg_idle_reboot" != 1 ]; then
+    i_on=0
+    return 0
+  fi
+  if [ "$i_on" != 1 ]; then
+    # just switched on: count from now, never from an old timestamp
+    i_on=1
+    if [ "$i_afu" = 1 ]; then
+      i_saved=0
+      idle_seen_unlocked
+    fi
+  fi
+  [ "$NOW" -ge "$i_next" ] || return 0
+
+  if [ "$i_afu" != 1 ]; then
+    # before the first unlock the data is still encrypted at rest, a restart
+    # would buy nothing. Also what stops us from looping after our own restart.
+    i_next=$((NOW + 30))
+    if ce_unlocked; then
+      i_afu=1
+      i_saved=0
+      i_next=$NOW
+      idle_seen_unlocked
+      log_msg I "auto restart: first unlock seen, restart after ${cfg_idle_minutes} min without one"
+    fi
+    return 0
+  fi
+
+  if screen_on; then
+    i_next=$((NOW + 5))
+    if ! is_locked; then
+      idle_seen_unlocked
+      return 0
+    fi
+  else
+    i_next=$((NOW + 30))
+    # screen just went off: make sure the latest unlock time is on disk
+    if [ "$i_saved" != "$i_last" ]; then
+      echo "$i_last" >"$IDLEF"
+      i_saved=$i_last
+    fi
+  fi
+
+  [ $((NOW - i_last)) -ge $((cfg_idle_minutes * IDLE_UNIT)) ] || return 0
+  [ "$NOW" -ge "$i_hold" ] || return 0
+  if in_call; then
+    i_hold=$((NOW + 5 * IDLE_UNIT))
+    log_msg I "auto restart is due, but a call is active - trying again in 5 min"
+    return 0
+  fi
+  idle_fire
+}
+
 # ------------------------------------------------------------ main loop
 
 while :; do
@@ -616,6 +712,7 @@ while :; do
   peer_tick
   guard_tick
   block_tick
+  idle_tick
 
   if [ "$cfg_enabled" = 1 ] && [ "$block_applied" = 0 ]; then
     chooser_tick

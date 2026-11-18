@@ -33,6 +33,11 @@ elif [ "$cfg_guard" = 1 ]; then
 else
   echo "- USB guard: off"
 fi
+if [ "$cfg_idle_reboot" = 1 ]; then
+  echo "- auto restart: after $cfg_idle_minutes min without unlock (clean cache: $cfg_clean_cache)"
+else
+  echo "- auto restart: off"
+fi
 echo " "
 
 if [ -r "$SESSION" ]; then

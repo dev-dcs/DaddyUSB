@@ -93,6 +93,22 @@ cmd_status() {
     "${_block:-off}" "$_how" "$(kgate_state "$KGATE_GADGET")" "$(kgate_state "$KGATE_HOST")"
   printf '"guard":{"enabled":%s,"armed":%s,"left":%s,"timeout":%s,"action":"%s"},' \
     "$(jbool "$cfg_guard")" "$_armed" "$_left" "$cfg_guard_timeout" "$cfg_guard_action"
+  # auto restart: seconds left, -1 = clock not running yet (before first unlock)
+  _ileft=-1
+  if [ "$cfg_idle_reboot" = 1 ] && [ -r "$IDLEF" ]; then
+    read -r _ilast _ <"$IDLEF"
+    uptime_now
+    _ilimit=$((cfg_idle_minutes * IDLE_UNIT))
+    if [ "$D_LOCKED" = true ]; then
+      _ileft=$((${_ilast:-0} + _ilimit - NOW))
+      [ "$_ileft" -lt 0 ] && _ileft=0
+    else
+      # unlocked right now, the clock restarts the moment it locks
+      _ileft=$_ilimit
+    fi
+  fi
+  printf '"idle":{"enabled":%s,"minutes":%s,"left":%s,"clean_cache":%s},' \
+    "$(jbool "$cfg_idle_reboot")" "$cfg_idle_minutes" "$_ileft" "$(jbool "$cfg_clean_cache")"
   printf '"peers":['
   _first=1
   if [ -r "$PEERF" ]; then
@@ -118,6 +134,8 @@ cmd_config() {
   printf '"block":%s,"guard":%s,"guard_timeout":"%s","guard_sticky":%s,"guard_cutoff":%s,"guard_warn":%s,"guard_action":"%s",' \
     "$(jbool "$cfg_block")" "$(jbool "$cfg_guard")" "$cfg_guard_timeout" "$(jbool "$cfg_guard_sticky")" \
     "$(jbool "$cfg_guard_cutoff")" "$(jbool "$cfg_guard_warn")" "$cfg_guard_action"
+  printf '"idle_reboot":%s,"idle_minutes":"%s","clean_cache":%s,' \
+    "$(jbool "$cfg_idle_reboot")" "$cfg_idle_minutes" "$(jbool "$cfg_clean_cache")"
   printf '"dnd_apps":['
   _first=1
   if [ -r "$DND_LIST" ]; then

@@ -25,6 +25,8 @@ Xposed API.
 - **USB guard**: unknown USB device + locked phone + no unlock in time = restart (see below)
 - **Block all USB data**: charging only, both directions, survives reboots
 - Connection **history** and a **trusted devices** list
+- **Auto restart** when the phone hasn't been unlocked for a set time
+- Optional **app cache cleanup** before any restart the module does
 
 ## Requirements
 
@@ -88,6 +90,33 @@ computer's side. So for most computers the fingerprint only describes the
 *kind* of port, and trusting it trusts every computer that looks the same.
 The WebUI warns about that before you trust a generic fingerprint. For
 computers, the simplest habit is to unlock when you plug in; that disarms the guard anyway.
+
+## Auto restart
+
+Restarts the phone when it hasn't been unlocked for a while (10 minutes to
+72 hours, default 18 h), so a phone that's been lost or taken sits in
+"before first unlock" state instead of staying unlocked-since-boot forever.
+
+- The clock starts when the phone locks and resets on every unlock. "Unlocked"
+  means the secure lock screen is gone, the same signal the USB guard uses.
+- Lock state is only checked while the screen is on (every 5 s), because
+  that's the only time someone can unlock. With the screen off the daemon
+  just compares timestamps.
+- Never before the first unlock after boot: nothing to protect yet, and it
+  means the module's own restart can't loop.
+- An active phone call postpones it by 5 minutes at a time.
+- In deep sleep the daemon doesn't run, but the boot clock keeps counting, so
+  the restart lands on the phone's next wake-up after the deadline. On a phone
+  with a network connection that's usually within minutes.
+
+### Clear app caches before restarting
+
+Off by default. When on, any restart the module triggers (USB guard or auto
+restart) first runs `pm trim-caches`, which is Android's own cleaner and wipes
+every app's cache directories. It's capped at 20 s for the guard and 60 s for
+auto restart, and the restart goes ahead even if it isn't done.
+`dalvik-cache` is deliberately left alone, since wiping it only makes the next
+boot slow.
 
 ## Block all USB data
 

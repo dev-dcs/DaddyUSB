@@ -39,6 +39,7 @@
       <div class="row"><span>USB debugging</span><b id="st-adb">-</b></div>
       <div class="row"><span>Chooser</span><b id="st-session">-</b></div>
       <div class="row"><span>Other end</span><b id="st-peer">-</b></div>
+      <div class="row"><span>Auto restart</span><b id="st-idle">-</b></div>
     </div>
 
     <div class="card">
@@ -170,6 +171,40 @@
         <input type="checkbox" data-key="guard_warn"><i class="sw"></i>
       </label>
       <p class="hint">Only arms after the first unlock since boot. Before that your data is still encrypted, so a restart wouldn't add anything.</p>
+    </div>
+
+    <div class="card">
+      <label class="switch-row">
+        <span>Auto restart<small>Restart the phone when it hasn't been unlocked for a while</small></span>
+        <input type="checkbox" data-key="idle_reboot" data-confirm="idle"><i class="sw"></i>
+      </label>
+      <label class="field">
+        <span>Not unlocked for</span>
+        <select data-key="idle_minutes">
+          <option value="10">10 minutes</option>
+          <option value="30">30 minutes</option>
+          <option value="60">1 hour</option>
+          <option value="120">2 hours</option>
+          <option value="240">4 hours</option>
+          <option value="480">8 hours</option>
+          <option value="720">12 hours</option>
+          <option value="1080">18 hours</option>
+          <option value="1440">24 hours</option>
+          <option value="2160">36 hours</option>
+          <option value="2880">48 hours</option>
+          <option value="4320">72 hours</option>
+        </select>
+      </label>
+      <p class="hint">The clock starts when the phone locks and resets on every unlock. It waits during calls,
+        and does nothing before the first unlock after a boot. In deep sleep the restart happens on the
+        phone's next wake-up after the time is up, usually within minutes.</p>
+    </div>
+
+    <div class="card">
+      <label class="switch-row">
+        <span>Clear app caches before restarting<small>For both the USB guard and auto restart. Uses Android's own cache trimmer, gives up after a few seconds</small></span>
+        <input type="checkbox" data-key="clean_cache"><i class="sw"></i>
+      </label>
     </div>
 
     <div class="card">

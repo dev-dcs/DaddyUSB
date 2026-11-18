@@ -24,6 +24,9 @@ HISTORY=$DATA/history.log
 PEERF=$RUN/peer
 GUARDF=$RUN/guard
 BLOCKF=$RUN/block
+IDLEF=$RUN/idle_last
+# seconds per "minute" of idle_minutes. Only the desktop test rig changes it.
+IDLE_UNIT=${USBMGR_IDLE_UNIT:-60}
 # configfs lives at /config on most phones, some vendors only have the sysfs one
 CFGFS_ROOTS=${USBMGR_CONFIGFS:-/config /sys/kernel/config}
 CR=$(printf '\r')
@@ -91,12 +94,15 @@ conf_defaults() {
   cfg_guard_cutoff=1
   cfg_guard_warn=1
   cfg_guard_action=reboot
+  cfg_idle_reboot=0
+  cfg_idle_minutes=1080
+  cfg_clean_cache=0
 }
 
 conf_valid() {
   case $1 in
     enabled | prompt | default_adb | adb_off_unplug | defer_locked | dnd | notify | \
-      block | guard | guard_sticky | guard_cutoff | guard_warn)
+      block | guard | guard_sticky | guard_cutoff | guard_warn | idle_reboot | clean_cache)
       [ "$2" = 0 ] || [ "$2" = 1 ] ;;
     default_mode) is_mode "$2" ;;
     dnd_action) [ "$2" = charging ] || [ "$2" = default ] ;;
@@ -105,6 +111,9 @@ conf_valid() {
       case $2 in '' | *[!0-9]*) return 1 ;; esac
       [ "$2" -ge 10 ] && [ "$2" -le 600 ] ;;
     guard_action) [ "$2" = reboot ] || [ "$2" = test ] ;;
+    idle_minutes)
+      case $2 in '' | *[!0-9]*) return 1 ;; esac
+      [ "$2" -ge 10 ] && [ "$2" -le 4320 ] ;;
     *) return 1 ;;
   esac
 }
@@ -128,6 +137,9 @@ conf_assign() {
     guard_cutoff) cfg_guard_cutoff=$2 ;;
     guard_warn) cfg_guard_warn=$2 ;;
     guard_action) cfg_guard_action=$2 ;;
+    idle_reboot) cfg_idle_reboot=$2 ;;
+    idle_minutes) cfg_idle_minutes=$2 ;;
+    clean_cache) cfg_clean_cache=$2 ;;
   esac
 }
 
@@ -161,6 +173,9 @@ conf_save() {
     echo "guard_cutoff=$cfg_guard_cutoff"
     echo "guard_warn=$cfg_guard_warn"
     echo "guard_action=$cfg_guard_action"
+    echo "idle_reboot=$cfg_idle_reboot"
+    echo "idle_minutes=$cfg_idle_minutes"
+    echo "clean_cache=$cfg_clean_cache"
   } >"$CONF.tmp" && mv -f "$CONF.tmp" "$CONF"
 }
 
@@ -860,12 +875,45 @@ run_fresh() {
   [ -r "$RUN/boot_id" ] && read -r _old <"$RUN/boot_id"
   [ "$_bid" = "$_old" ] && return 0
   rm -f "$RUN/udc.saved" "$RUN/authdef.saved" "$RUN/hubs.cut" "$RUN/devs.cut" "$RUN/legacy.cut" \
-    "$RUN/kgadget.set" "$RUN/khost.set" "$BLOCKF" "$GUARDF" "$PEERF"
+    "$RUN/kgadget.set" "$RUN/khost.set" "$BLOCKF" "$GUARDF" "$PEERF" "$IDLEF"
   echo "$_bid" >"$RUN/boot_id"
 }
 
 wakelock() {
   echo usbguard >"$SYSFS/power/wake_$1" 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------- auto restart
+
+# Panel backlight > 0 = screen (or AOD) is on, the only time someone can
+# unlock. No backlight node at all = can't tell, caller assumes on.
+screen_on() {
+  _any=0
+  for _b in "$SYSFS"/class/backlight/*/brightness "$SYSFS"/class/leds/lcd-backlight/brightness; do
+    [ -r "$_b" ] || continue
+    _any=1
+    read -r _v <"$_b" 2>/dev/null
+    [ "${_v:-0}" != 0 ] && return 0
+  done
+  [ "$_any" = 0 ]
+}
+
+# ringing or off-hook on any SIM
+in_call() {
+  dumpsys telephony.registry 2>/dev/null | grep -q 'mCallState=[12]'
+}
+
+# Android's own cache trimmer: asks for far more free space than exists, so
+# it clears every app's cache dirs. Never longer than $1 seconds, the restart
+# matters more than the cleanup.
+clean_caches() {
+  log_msg I "clearing app caches before restart"
+  if timeout "$1" pm trim-caches 9999G >/dev/null 2>&1; then
+    log_msg I "app caches cleared"
+  else
+    log_msg W "cache cleanup didn't finish within ${1}s (or failed), restarting anyway"
+  fi
   return 0
 }
 

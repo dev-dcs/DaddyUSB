@@ -165,6 +165,17 @@
       ? peers.map((p) => `${p.label}${p.trusted ? ' (trusted)' : ''}`).join(', ')
       : '-';
 
+    const idle = s.idle || {};
+    const dur = (sec) => {
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      return h ? `${h}h ${m}m` : `${m}m`;
+    };
+    $('#st-idle').textContent = !idle.enabled ? 'Off'
+      : idle.left < 0 ? 'Waiting for first unlock'
+        : s.locked === 'true' ? `in ${dur(idle.left)}`
+          : `${dur(idle.left)} after lock`;
+
     const g = s.guard || {};
     $('#guard-banner').hidden = !g.armed;
     if (g.armed) {
@@ -513,6 +524,11 @@
         'Computers won\'t see the phone at all, USB sticks, keyboards and docks stop working and ADB is '
         + 'switched off. Charging keeps working.\n\nStays on after a reboot until you switch it off here.',
         'Block'],
+      idle: ['Turn on auto restart?',
+        'The phone restarts on its own when it hasn\'t been unlocked for the time you pick. Unsaved work '
+        + 'in open apps is lost, and until you unlock after the restart most apps can\'t run, so their '
+        + 'notifications wait.\n\nCalls in progress postpone it.',
+        'Turn on'],
       guard: ['Turn on the USB guard?',
         'If an unknown USB device gets connected while the phone is locked and nobody unlocks it in time, '
         + 'the phone restarts. Unsaved work in open apps is lost.\n\nTrusted devices never trigger it. '
@@ -530,7 +546,7 @@
       }
       if (await setKey(key, val)) {
         toast('Saved');
-        if (['enabled', 'block', 'guard'].includes(key)) setTimeout(refreshStatus, 1200);
+        if (['enabled', 'block', 'guard', 'idle_reboot', 'idle_minutes'].includes(key)) setTimeout(refreshStatus, 1200);
       }
     }));
 
