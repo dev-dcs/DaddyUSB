@@ -134,8 +134,8 @@ cmd_config() {
   printf '"block":%s,"guard":%s,"guard_timeout":"%s","guard_sticky":%s,"guard_cutoff":%s,"guard_warn":%s,"guard_action":"%s",' \
     "$(jbool "$cfg_block")" "$(jbool "$cfg_guard")" "$cfg_guard_timeout" "$(jbool "$cfg_guard_sticky")" \
     "$(jbool "$cfg_guard_cutoff")" "$(jbool "$cfg_guard_warn")" "$cfg_guard_action"
-  printf '"idle_reboot":%s,"idle_minutes":"%s","clean_cache":%s,' \
-    "$(jbool "$cfg_idle_reboot")" "$cfg_idle_minutes" "$(jbool "$cfg_clean_cache")"
+  printf '"idle_reboot":%s,"idle_minutes":"%s","clean_cache":%s,"remember_hours":"%s",' \
+    "$(jbool "$cfg_idle_reboot")" "$cfg_idle_minutes" "$(jbool "$cfg_clean_cache")" "$cfg_remember_hours"
   printf '"dnd_apps":['
   _first=1
   if [ -r "$DND_LIST" ]; then
@@ -158,6 +158,19 @@ cmd_set() {
   printf '{"ok":true}\n'
 }
 
+# the chooser's answer also becomes the remembered choice for this device
+remember_data() {
+  [ "$cfg_remember_hours" -gt 0 ] 2>/dev/null || return 0
+  peer_pc || return 0
+  mem_put "$PC_FP" data "$1" "$2" "$PC_LABEL"
+}
+
+# a real mode was picked: a per-connection "charge only" cut has to go
+lift_charge() {
+  rm -f "$RUN/charge_on.flag"
+  : >"$RUN/charge_off.flag"
+}
+
 cmd_choose() {
   check_mode_adb "$1" "$2"
   conf_load
@@ -171,6 +184,8 @@ cmd_choose() {
     read -r _sid _st <"$SESSION"
     echo "$_sid answered" >"$SESSION"
   fi
+  lift_charge
+  remember_data "$1" "$2"
   lock_take
   apply_cfg "$1" "$2"
   _rc=$?
@@ -180,6 +195,42 @@ cmd_choose() {
   setsid sh "$0" verify "$1" "$2" </dev/null >/dev/null 2>&1 &
   [ "$_rc" = 0 ] || jerr "apply failed, see log"
   printf '{"ok":true}\n'
+}
+
+cmd_charge() {
+  conf_load
+  if [ -r "$SESSION" ]; then
+    read -r _sid _st <"$SESSION"
+    echo "$_sid answered" >"$SESSION"
+  fi
+  if [ "$cfg_remember_hours" -gt 0 ] 2>/dev/null && peer_pc; then
+    mem_put "$PC_FP" charge charging 0 "$PC_LABEL"
+  fi
+  rm -f "$RUN/charge_off.flag"
+  : >"$RUN/charge_on.flag"
+  wake_daemon answered
+  printf '{"ok":true}\n'
+}
+
+cmd_remembered() {
+  conf_load
+  _now=$(date +%s)
+  _span=$((cfg_remember_hours * 3600))
+  printf '['
+  _first=1
+  if [ -r "$MEMF" ]; then
+    while IFS='|' read -r _f _d _m _a _t _l; do
+      is_fp "$_f" || continue
+      case $_t in '' | *[!0-9]*) continue ;; esac
+      _left=$((_t + _span - _now))
+      [ "$_left" -lt 0 ] && _left=0
+      [ "$_first" = 1 ] || printf ','
+      printf '{"fp":"%s","decision":"%s","mode":"%s","adb":%s,"t":%s,"left":%s,"label":"%s"}' \
+        "$_f" "$_d" "$_m" "$(jbool "$_a")" "$_t" "$_left" "$_l"
+      _first=0
+    done <"$MEMF"
+  fi
+  printf ']\n'
 }
 
 cmd_dismiss() {
@@ -194,6 +245,10 @@ cmd_dismiss() {
 
 cmd_apply() {
   check_mode_adb "$1" "$2"
+  conf_load
+  lift_charge
+  remember_data "$1" "$2"
+  wake_daemon answered
   lock_take
   apply_cfg "$1" "$2"
   _rc=$?
@@ -339,6 +394,17 @@ case $1 in
   set) cmd_set "$2" "$3" ;;
   choose) cmd_choose "$2" "$3" "$4" ;;
   dismiss) cmd_dismiss ;;
+  charge-only) cmd_charge ;;
+  remembered) cmd_remembered ;;
+  forget)
+    is_fp "$2" || jerr "bad fingerprint"
+    mem_forget "$2"
+    printf '{"ok":true}\n'
+    ;;
+  forget-all)
+    : >"$MEMF"
+    printf '{"ok":true}\n'
+    ;;
   apply) cmd_apply "$2" "$3" ;;
   verify) cmd_verify "$2" "$3" ;;
   prompt) cmd_prompt ;;
@@ -378,12 +444,13 @@ case $1 in
     cat <<EOF
 usage: usbctl <command>
   status | config | set KEY VALUE
-  choose MODE ADB [default] | dismiss | apply MODE ADB | prompt
+  choose MODE ADB [default] | charge-only | dismiss | apply MODE ADB | prompt
+  remembered | forget FP | forget-all
   packages | dnd add|del PKG
   block on|off | history [N] | history-clear
   trusted | trust FP [unique|model|generic] [LABEL] | untrust FP
   log [N] | log-clear | restart | version
-modes: charging mtp ptp rndis midi    adb: 0|1
+modes: charging mtp ptp rndis midi keep    adb: 0|1
 EOF
     ;;
 esac

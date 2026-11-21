@@ -89,6 +89,28 @@
     </div>
 
     <div class="card">
+      <h2>Remembered devices</h2>
+      <p class="hint">After you answer the chooser, the same device gets the same answer without asking,
+        until it has been unplugged for this long. "Data" choices only repeat once the phone is unlocked;
+        "Charge only" applies straight away.</p>
+      <label class="field">
+        <span>Remember for</span>
+        <select data-key="remember_hours">
+          <option value="0">Don't remember</option>
+          <option value="1">1 hour</option>
+          <option value="4">4 hours</option>
+          <option value="8">8 hours</option>
+          <option value="12">12 hours</option>
+          <option value="24">24 hours</option>
+          <option value="48">2 days</option>
+          <option value="168">1 week</option>
+        </select>
+      </label>
+      <ul class="applist" id="mem-list"></ul>
+      <p class="hint" id="mem-empty">Nothing remembered yet.</p>
+    </div>
+
+    <div class="card">
       <h2>Default config</h2>
       <p class="hint">Pre-selected in the chooser, and used when asking is off.</p>
       <label class="field">
@@ -274,32 +296,55 @@
   <button data-view="log">Log</button>
 </nav>
 
-<!-- the chooser, shown when a computer is waiting for an answer -->
+<!-- the chooser, shown when a computer/car/dock is waiting for an answer -->
 <div class="scrim" id="chooser" hidden>
   <div class="sheet" role="dialog" aria-labelledby="ch-title">
     <div class="sheet-head">
       <div class="usb-badge" id="ch-badge"></div>
       <div>
-        <h2 id="ch-title">Connected to a computer</h2>
-        <p class="hint">What should this connection be used for?</p>
+        <h2 id="ch-title">USB connected</h2>
+        <p class="hint" id="ch-peer"></p>
       </div>
     </div>
-    <div class="modes" id="ch-modes"></div>
-    <label class="switch-row boxed">
-      <span>USB debugging (ADB)<small>Only for this connection</small></span>
-      <input type="checkbox" id="ch-adb"><i class="sw"></i>
-    </label>
-    <label class="check-row">
-      <input type="checkbox" id="ch-default">
-      <span>Make this my default</span>
-    </label>
-    <label class="check-row" id="ch-trust-row" hidden>
-      <input type="checkbox" id="ch-trust">
-      <span>Trust this computer for the USB guard<small id="ch-trust-hint"></small></span>
-    </label>
-    <div class="sheet-actions">
-      <button class="btn" id="ch-later">Not now</button>
-      <button class="btn primary" id="ch-ok">OK</button>
+
+    <!-- step 1: data or not at all -->
+    <div id="ch-step1">
+      <p class="ask-line">Trust this device with your data?</p>
+      <div class="trust-choice">
+        <button class="choice" id="ch-data">
+          <span class="choice-icon" id="ch-data-icon"></span>
+          <span><b>Data</b><small>Pick what it can use next</small></span>
+        </button>
+        <button class="choice" id="ch-charge">
+          <span class="choice-icon" id="ch-charge-icon"></span>
+          <span><b>Charge only</b><small>No data at all while it stays plugged in</small></span>
+        </button>
+      </div>
+      <p class="hint" id="ch-remember"></p>
+      <label class="check-row" id="ch-trust-row" hidden>
+        <input type="checkbox" id="ch-trust">
+        <span>Also trust it for the USB guard<small id="ch-trust-hint"></small></span>
+      </label>
+      <div class="sheet-actions">
+        <button class="btn" id="ch-later">Not now</button>
+      </div>
+    </div>
+
+    <!-- step 2: what the data connection is for -->
+    <div id="ch-step2" hidden>
+      <div class="modes" id="ch-modes"></div>
+      <label class="switch-row boxed">
+        <span>USB debugging (ADB)<small>Only for this connection</small></span>
+        <input type="checkbox" id="ch-adb"><i class="sw"></i>
+      </label>
+      <label class="check-row">
+        <input type="checkbox" id="ch-default">
+        <span>Make this my default</span>
+      </label>
+      <div class="sheet-actions">
+        <button class="btn" id="ch-back">Back</button>
+        <button class="btn primary" id="ch-ok">OK</button>
+      </div>
     </div>
   </div>
 </div>

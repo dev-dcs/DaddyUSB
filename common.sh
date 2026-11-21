@@ -25,6 +25,7 @@ PEERF=$RUN/peer
 GUARDF=$RUN/guard
 BLOCKF=$RUN/block
 IDLEF=$RUN/idle_last
+MEMF=$DATA/remembered.list
 # seconds per "minute" of idle_minutes. Only the desktop test rig changes it.
 IDLE_UNIT=${USBMGR_IDLE_UNIT:-60}
 # configfs lives at /config on most phones, some vendors only have the sysfs one
@@ -60,8 +61,10 @@ uptime_now() {
 
 # ---------------------------------------------------------------- settings
 
+# keep = leave the USB functions to Android (cars/docks that switch the phone
+# into accessory mode themselves, Android Auto) and only set ADB
 is_mode() {
-  case $1 in charging | mtp | ptp | rndis | midi) return 0 ;; esac
+  case $1 in charging | mtp | ptp | rndis | midi | keep) return 0 ;; esac
   return 1
 }
 
@@ -97,6 +100,7 @@ conf_defaults() {
   cfg_idle_reboot=0
   cfg_idle_minutes=1080
   cfg_clean_cache=0
+  cfg_remember_hours=12
 }
 
 conf_valid() {
@@ -114,6 +118,9 @@ conf_valid() {
     idle_minutes)
       case $2 in '' | *[!0-9]*) return 1 ;; esac
       [ "$2" -ge 10 ] && [ "$2" -le 4320 ] ;;
+    remember_hours)
+      case $2 in '' | *[!0-9]*) return 1 ;; esac
+      [ "$2" -le 168 ] ;;
     *) return 1 ;;
   esac
 }
@@ -140,6 +147,7 @@ conf_assign() {
     idle_reboot) cfg_idle_reboot=$2 ;;
     idle_minutes) cfg_idle_minutes=$2 ;;
     clean_cache) cfg_clean_cache=$2 ;;
+    remember_hours) cfg_remember_hours=$2 ;;
   esac
 }
 
@@ -176,6 +184,7 @@ conf_save() {
     echo "idle_reboot=$cfg_idle_reboot"
     echo "idle_minutes=$cfg_idle_minutes"
     echo "clean_cache=$cfg_clean_cache"
+    echo "remember_hours=$cfg_remember_hours"
   } >"$CONF.tmp" && mv -f "$CONF.tmp" "$CONF"
 }
 
@@ -372,7 +381,10 @@ apply_cfg() {
   _rc=0
   _fn=$1
   [ "$_fn" = charging ] && _fn=none
-  if [ "$SDK" -ge 28 ]; then
+  _o=
+  if [ "$_fn" = keep ]; then
+    : # functions stay whatever Android (or the car) picked
+  elif [ "$SDK" -ge 28 ]; then
     _o=$(svc usb setFunctions "$_fn" 2>&1)
   else
     _o=$(svc usb setFunction "$_fn" 2>&1)
@@ -402,12 +414,102 @@ verify_cfg() {
   while [ "$_i" -lt "${3:-8}" ]; do
     usb_dump
     adb_get
+    [ "$1" = keep ] && _want=$D_FUNCS
     if [ "$D_FUNCS" = "$_want" ] && [ "$ADB_NOW" = "$2" ]; then
       return 0
     fi
     sleep 1
     _i=$((_i + 1))
   done
+  return 1
+}
+
+# ---------------------------------------------------------------- remembered choices
+#
+# remembered.list: fp|decision|mode|adb|epoch|label
+#   decision = data (mode + adb get repeated) or charge (data cut)
+#   epoch    = last time that device was connected (set on connect and on unplug)
+# Wall clock on purpose: "12 h since I was last in the car" spans reboots.
+
+# mem_get FP: fills M_DEC M_MODE M_ADB M_TIME M_LABEL, 0 = found and still fresh
+mem_get() {
+  M_DEC=
+  M_MODE=
+  M_ADB=
+  M_TIME=0
+  M_LABEL=
+  [ "$cfg_remember_hours" -gt 0 ] 2>/dev/null || return 1
+  [ -r "$MEMF" ] || return 1
+  while IFS='|' read -r _mf _md _mm _ma _mt _ml; do
+    [ "$_mf" = "$1" ] || continue
+    case $_mt in '' | *[!0-9]*) return 1 ;; esac
+    case $_md in data | charge) ;; *) return 1 ;; esac
+    is_mode "$_mm" || return 1
+    M_DEC=$_md
+    M_MODE=$_mm
+    M_ADB=$_ma
+    M_TIME=$_mt
+    M_LABEL=$_ml
+    [ $(($(date +%s) - _mt)) -lt $((cfg_remember_hours * 3600)) ]
+    return
+  done <"$MEMF"
+  return 1
+}
+
+# mem_put FP DECISION MODE ADB LABEL - replaces any older line for FP
+mem_put() {
+  is_fp "$1" || return 1
+  _now=$(date +%s)
+  _lbl=$(label_clean "$5")
+  {
+    if [ -r "$MEMF" ]; then
+      while IFS= read -r _ml; do
+        [ "${_ml%%|*}" = "$1" ] || printf '%s\n' "$_ml"
+      done <"$MEMF"
+    fi
+    echo "$1|$2|$3|$4|$_now|$_lbl"
+  } >"$MEMF.tmp" && mv -f "$MEMF.tmp" "$MEMF"
+}
+
+# mem_touch FP - "connected just now", keeps the decision as it was
+mem_touch() {
+  [ -r "$MEMF" ] || return 0
+  _now=$(date +%s)
+  _hit=0
+  while IFS='|' read -r _mf _md _mm _ma _mt _ml; do
+    if [ "$_mf" = "$1" ]; then
+      echo "$_mf|$_md|$_mm|$_ma|$_now|$_ml"
+      _hit=1
+    elif [ -n "$_mf" ]; then
+      echo "$_mf|$_md|$_mm|$_ma|$_mt|$_ml"
+    fi
+  done <"$MEMF" >"$MEMF.tmp"
+  if [ "$_hit" = 1 ]; then mv -f "$MEMF.tmp" "$MEMF"; else rm -f "$MEMF.tmp"; fi
+  return 0
+}
+
+mem_forget() {
+  [ -r "$MEMF" ] || return 0
+  while IFS= read -r _ml; do
+    [ "${_ml%%|*}" = "$1" ] || printf '%s\n' "$_ml"
+  done <"$MEMF" >"$MEMF.tmp"
+  mv -f "$MEMF.tmp" "$MEMF"
+}
+
+# the computer/car/dock on the other end right now, from the daemon's peer file
+peer_pc() {
+  PC_FP=
+  PC_LABEL=
+  [ -r "$PEERF" ] || return 1
+  while IFS='|' read -r _pf _pl _; do
+    case $_pf in
+      pc:*)
+        PC_FP=$_pf
+        PC_LABEL=${_pl%, data blocked}
+        return 0
+        ;;
+    esac
+  done <"$PEERF"
   return 1
 }
 
@@ -783,13 +885,13 @@ pc_fingerprint() {
     read -r _typ <"$SYSFS/class/power_supply/usb/real_type"
   fi
   if [ -n "$_id" ]; then
-    echo "pc:pd:$_id|Computer or dock (PD $_id)|model"
+    echo "pc:pd:$_id|USB host or dock (PD $_id)|model"
     return 0
   fi
   _op=$(fp_clean "$_op")
   _spd=$(fp_clean "$_spd")
   _typ=$(fp_clean "$_typ")
-  echo "pc:op=$_op:spd=$_spd:t=$_typ:pd=$(fp_clean "$_pd")|Computer ($_spd, $_typ)|generic"
+  echo "pc:op=$_op:spd=$_spd:t=$_typ:pd=$(fp_clean "$_pd")|USB host ($_spd, $_typ)|generic"
 }
 
 # anything attached right now, even with data blocked? (no trust tricks here)

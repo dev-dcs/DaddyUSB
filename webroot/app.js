@@ -18,6 +18,7 @@
     { id: 'ptp', name: 'Photos', sub: 'PTP', icon: 'image' },
     { id: 'rndis', name: 'USB tethering', sub: 'RNDIS', icon: 'net' },
     { id: 'midi', name: 'MIDI', sub: 'Instruments, DAWs', icon: 'music' },
+    { id: 'keep', name: "Android's choice", sub: 'Cars, docks, Android Auto', icon: 'car' },
   ];
 
   const ICONS = {
@@ -29,6 +30,8 @@
     music: '<path d="M9 18V6l10-2v12"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="16" r="2"/>',
     host: '<rect x="7" y="3" width="10" height="7" rx="1.5"/><path d="M12 10v6"/><circle cx="12" cy="19" r="2.5"/>',
     off: '<path d="M7 7h10v6a5 5 0 0 1-10 0z"/><path d="M10 7V3M14 7V3M12 18v3"/>',
+    car: '<path d="M5 13l1.6-4.6A2 2 0 0 1 8.5 7h7a2 2 0 0 1 1.9 1.4L19 13"/><rect x="3" y="13" width="18" height="5" rx="1.5"/><circle cx="7.5" cy="18.5" r="1.5"/><circle cx="16.5" cy="18.5" r="1.5"/>',
+    swap: '<path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/>',
   };
 
   const svg = (name) =>
@@ -158,6 +161,7 @@
     const sessText = {
       none: '-', pending: 'Waiting for you', answered: 'Answered',
       auto: 'Default applied', dnd: 'Game mode',
+      waiting: 'Remembered, waits for unlock', remembered: 'Repeated last choice',
     };
     $('#st-session').textContent = sessText[s.session.state] || s.session.state;
     const peers = s.peers || [];
@@ -166,11 +170,6 @@
       : '-';
 
     const idle = s.idle || {};
-    const dur = (sec) => {
-      const h = Math.floor(sec / 3600);
-      const m = Math.floor((sec % 3600) / 60);
-      return h ? `${h}h ${m}m` : `${m}m`;
-    };
     $('#st-idle').textContent = !idle.enabled ? 'Off'
       : idle.left < 0 ? 'Waiting for first unlock'
         : s.locked === 'true' ? `in ${dur(idle.left)}`
@@ -185,9 +184,11 @@
     }
     const how = s.block_how === 'kernel' ? ' Enforced by the kernel.' : ' Userspace fallback.';
     $('#block-banner').hidden = s.block === 'off';
-    $('#block-banner-text').textContent = (s.block === 'guard'
-      ? 'Cut by the USB guard until the phone is unlocked.'
-      : 'Charging only. Turn it off under Security.') + how;
+    const why = {
+      guard: 'Cut by the USB guard until the phone is unlocked.',
+      charge: 'Charge only for this connection. Unplug, or pick a mode below to use data.',
+    };
+    $('#block-banner-text').textContent = (why[s.block] || 'Charging only. Turn it off under Security.') + how;
 
     // the two switches from the dev-dcs kernel patches
     const k = s.kernel || {};
@@ -242,20 +243,37 @@
     lastState = st;
   }
 
+  const pcPeers = () => ((status && status.peers) || []).filter((p) => p.fp.startsWith('pc:'));
+
+  function chooserStep(n) {
+    $('#ch-step1').hidden = n !== 1;
+    $('#ch-step2').hidden = n !== 2;
+  }
+
   function openChooser(sid) {
     chooserSid = sid;
-    choice.mode = (config && config.default_mode) || 'charging';
+    choice.mode = (config && config.default_mode) || 'keep';
+    // step 1 already covers "charge only", step 2 is about what data is for
+    if (choice.mode === 'charging') choice.mode = 'keep';
     choice.adb = !!(config && config.default_adb);
     $('#ch-default').checked = false;
-    const unknown = ((status && status.peers) || []).filter((p) => !p.trusted && p.fp.startsWith('pc:'));
+    const pc = pcPeers()[0];
+    $('#ch-peer').textContent = pc ? pc.label.replace(/, data blocked$/, '') : '';
+    const hours = Number((config && config.remember_hours) || 0);
+    $('#ch-remember').textContent = hours
+      ? `The answer is remembered for this device until it has been unplugged for ${hours} h.`
+      : 'Answers aren\'t remembered (Settings → Remembered devices).';
+    const unknown = pcPeers().filter((p) => !p.trusted);
+    const guardOn = !!(status && status.guard && status.guard.enabled);
     $('#ch-trust').checked = false;
-    $('#ch-trust-row').hidden = unknown.length === 0;
+    $('#ch-trust-row').hidden = unknown.length === 0 || !guardOn;
     if (unknown.length) {
       $('#ch-trust-hint').textContent = unknown[0].strength === 'generic'
         ? 'This computer has no readable ID, so any computer with the same port type would count as trusted.'
         : 'Identified by its USB-PD vendor/product ID (same model = same ID).';
     }
     renderChooser();
+    chooserStep(1);
     $('#chooser').hidden = false;
   }
 
@@ -265,7 +283,9 @@
 
   function renderChooser() {
     $('#ch-badge').innerHTML = svg('usb');
-    $('#ch-modes').innerHTML = MODES.map((m) => `
+    $('#ch-data-icon').innerHTML = svg('swap');
+    $('#ch-charge-icon').innerHTML = svg('bolt');
+    $('#ch-modes').innerHTML = MODES.filter((m) => m.id !== 'charging').map((m) => `
       <button class="mode${m.id === choice.mode ? ' on' : ''}" data-mode="${m.id}">
         ${svg(m.icon)}<span><b>${esc(m.name)}</b><small>${esc(m.sub)}</small></span>
       </button>`).join('');
@@ -294,13 +314,35 @@
       toast(r.error || 'Something went wrong');
       return;
     }
-    if ($('#ch-trust').checked) {
-      const unknown = ((status && status.peers) || []).filter((p) => !p.trusted && p.fp.startsWith('pc:'));
-      for (const p of unknown) await ctlJson('trust', p.fp, p.strength, p.label);
-    }
+    await trustIfAsked();
     closeChooser();
     toast(`${modeName(choice.mode)}, ADB ${choice.adb ? 'on' : 'off'}`);
     if ($('#ch-default').checked) loadConfig();
+    loadMem();
+    setTimeout(leave, 350);
+    refreshStatus();
+  }
+
+  async function trustIfAsked() {
+    if (!$('#ch-trust').checked) return;
+    for (const p of pcPeers().filter((x) => !x.trusted)) {
+      await ctlJson('trust', p.fp, p.strength, p.label.replace(/, data blocked$/, ''));
+    }
+  }
+
+  async function chargeOnly() {
+    if (busy) return;
+    busy = true;
+    const r = await ctlJson('charge-only');
+    busy = false;
+    if (!r.ok) {
+      toast(r.error || 'Something went wrong');
+      return;
+    }
+    await trustIfAsked();
+    closeChooser();
+    toast('Charge only, data cut until unplugged');
+    loadMem();
     setTimeout(leave, 350);
     refreshStatus();
   }
@@ -329,6 +371,28 @@
   async function loadConfig() {
     config = await ctlJson('config');
     renderConfig();
+    loadMem();
+  }
+
+  const dur = (sec) => {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    return h ? `${h}h ${m}m` : `${m}m`;
+  };
+
+  let remembered = [];
+  async function loadMem() {
+    const r = await ctl('remembered');
+    try { remembered = JSON.parse(r.stdout.trim()); } catch (_) { remembered = []; }
+    $('#mem-empty').hidden = remembered.length > 0;
+    $('#mem-list').innerHTML = remembered.map((m) => {
+      const what = m.decision === 'charge' ? 'Charge only'
+        : `Data · ${modeName(m.mode)}, ADB ${m.adb ? 'on' : 'off'}`;
+      const left = m.left > 0 ? tag([`${dur(m.left)} left`, 'ok']) : tag(['expired, will ask', '']);
+      return `<li><span class="name">${esc(m.label || m.fp)}<small>${esc(what)}</small>
+        <span class="meta">${left}</span></span>
+        <button class="btn" data-forget="${esc(m.fp)}">Forget</button></li>`;
+    }).join('');
   }
 
   async function setKey(key, value) {
@@ -482,6 +546,7 @@
     $$('.tabs button').forEach((b) => b.classList.toggle('on', b.dataset.view === name));
     if (name === 'log') loadLog();
     if (name === 'security') loadSecurity();
+    if (name === 'settings') loadMem();
     if (name === 'status') { live.touched = false; refreshStatus(); }
   }
 
@@ -497,6 +562,15 @@
     $('#ch-adb').addEventListener('change', (e) => { choice.adb = e.target.checked; });
     $('#ch-ok').addEventListener('click', answer);
     $('#ch-later').addEventListener('click', notNow);
+    $('#ch-data').addEventListener('click', () => { renderChooser(); chooserStep(2); });
+    $('#ch-back').addEventListener('click', () => chooserStep(1));
+    $('#ch-charge').addEventListener('click', chargeOnly);
+    $('#mem-list').addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-forget]');
+      if (!b) return;
+      await ctlJson('forget', b.dataset.forget);
+      loadMem();
+    });
 
     $('#live-modes').addEventListener('click', (e) => {
       const b = e.target.closest('[data-mode]');

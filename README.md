@@ -13,8 +13,10 @@ Xposed API.
 
 ## What it does
 
-- Prompts when a **computer** enumerates the phone (wall chargers don't trigger it)
-- Per-connection USB mode + ADB, with an optional "make this my default"
+- Prompts when a **computer, car or dock** enumerates the phone (wall chargers don't trigger it)
+- **Two-step chooser**: first "trust it with data?" (Data / Charge only), then the USB mode + ADB
+- **Remembers the answer per device** for 12 h (adjustable) after it was last connected
+- "Charge only" really means no data: the link is cut for that connection, not just MTP locked
 - **ADB off on unplug** (on by default)
 - **OTG left alone**: when the phone is the USB host nothing pops up
 - **Waits for unlock**: the chooser shows up once the secure lock screen is gone
@@ -54,6 +56,36 @@ otherwise you'll get two prompts.
 `bin/usbmgrd` is a small shell daemon. It sleeps on a FIFO with a 1 s timeout,
 so an idle tick is a couple of builtin `read`s and no forks. `dumpsys` only runs
 when something actually happens.
+
+## The chooser
+
+When a computer, car or dock picks the phone up (and the phone is unlocked):
+
+1. **Trust this device with your data?**
+   - **Charge only**: USB data is cut for this connection, using the kernel
+     switch or the gadget unbind, until you unplug. Android's own "No data
+     transfer" isn't enough here, because the host can still see a locked MTP
+     device and a car can still start Android Auto.
+   - **Data**: goes on to step 2.
+2. **What for?** File transfer, photos, USB tethering, MIDI, charge only, or
+   **Android's choice**, which leaves the USB mode alone so a car can switch
+   the phone into Android Auto itself. Plus ADB for this connection.
+
+The answer is remembered for that device (by its fingerprint, see the guard
+section below) until it has been **unplugged for 12 hours** (Settings →
+Remembered devices, 1 h to 1 week, or off). The clock restarts on every
+plug-in and unplug, so a car you use every day never asks again, while one
+you see once a month asks every time.
+
+- A remembered **Charge only** applies the moment the device is plugged in, locked or not.
+- A remembered **Data** choice only repeats once the phone is unlocked.
+- The action button or Settings → Forget brings the question back.
+
+Same caveat as the guard's trusted list: most computers and cars only have
+a "port type" fingerprint, so two hosts of the same kind share a memory
+entry. If you plug into the car while the phone is locked and the USB
+guard is on, also tick "Also trust it for the USB guard" in the chooser,
+otherwise the guard will count down.
 
 ## USB guard
 

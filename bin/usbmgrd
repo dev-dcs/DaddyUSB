@@ -94,6 +94,14 @@ g_lastlock=0
 g_hids=
 g_tags=
 cut_active=0
+# "charge only" for the current connection (chosen now or remembered)
+cut_session=0
+# fingerprint of the computer/car this chooser session is about, and a
+# remembered "data" choice waiting for the phone to be unlocked
+s_fp=
+s_rem=
+p_pcfp=
+p_pclabel=
 block_applied=0
 block_why=
 block_how=
@@ -133,6 +141,25 @@ session_start() {
   lock_noted=0
   probe_phys
   log_msg I "computer connected (tc=$TRUST_TC ps=$TRUST_PS)"
+  s_fp=$p_pcfp
+  s_rem=
+
+  # seen this one recently? repeat what was picked last time
+  if [ "$cfg_prompt" = 1 ] && [ -n "$s_fp" ] && mem_get "$s_fp"; then
+    _ago=$((($(date +%s) - M_TIME) / 60))
+    if [ "$M_DEC" = charge ]; then
+      session_set remembered
+      mem_touch "$s_fp"
+      charge_only "remembered from ${_ago} min ago"
+      return
+    fi
+    # data only ever gets repeated with the phone unlocked
+    s_rem="$M_MODE $M_ADB"
+    log_msg I "$M_LABEL last connected ${_ago} min ago: data, $M_MODE adb=$M_ADB - repeating it once unlocked"
+    session_set waiting
+    try_launch
+    return
+  fi
 
   if [ "$cfg_dnd" = 1 ] && [ -s "$DND_LIST" ]; then
     _fg=$(foreground_pkg)
@@ -161,7 +188,38 @@ session_start() {
   try_launch
 }
 
+# Cut data for this connection only. Needs a way to notice the unplug while
+# the link is down (Type-C partner or usb power supply); without one, fall
+# back to Android's own "no data transfer".
+charge_only() {
+  if [ "$TRUST_TC" = 1 ] || [ "$TRUST_PS" = 1 ]; then
+    cut_session=1
+    log_msg I "charge only ($1): USB data cut until unplugged"
+  else
+    log_msg W "charge only ($1): can't detect the unplug on this device, using Android's charge-only mode instead"
+    apply_cfg charging 0
+  fi
+}
+
 try_launch() {
+  if [ -n "$s_rem" ]; then
+    if is_locked; then
+      if [ "$lock_noted" = 0 ]; then
+        log_msg I "locked, remembered choice waits for unlock"
+        lock_noted=1
+      fi
+      return 1
+    fi
+    # shellcheck disable=SC2086
+    set -- $s_rem
+    s_rem=
+    launched=1
+    session_set remembered
+    apply_cfg "$1" "$2"
+    mem_touch "$s_fp"
+    log_msg I "repeated last choice: $1 adb=$2"
+    return 0
+  fi
   if [ "$cfg_defer_locked" = 1 ] && is_locked; then
     if [ "$lock_noted" = 0 ]; then
       log_msg I "locked, chooser waits for unlock"
@@ -191,9 +249,13 @@ session_end() {
       fi
     fi
   fi
+  # remember when this device was last connected, not just when it was picked
+  [ -n "$s_fp" ] && mem_touch "$s_fp"
   rm -f "$SESSION"
   sid=0
   state=none
+  s_fp=
+  s_rem=
   cooldown=$((NOW + 2))
 }
 
@@ -227,10 +289,14 @@ session_tick() {
     read -r _fsid _fstate <"$SESSION"
     [ "$_fsid" = "$sid" ] && [ -n "$_fstate" ] && state=$_fstate
   fi
-  if [ "$state" = pending ] && [ "$launched" = 0 ] && [ $((NOW - last_try)) -ge 2 ]; then
-    last_try=$NOW
-    try_launch
-  fi
+  case $state in
+    pending | waiting)
+      if [ "$launched" = 0 ] && [ $((NOW - last_try)) -ge 2 ]; then
+        last_try=$NOW
+        try_launch
+      fi
+      ;;
+  esac
   return 0
 }
 
@@ -311,8 +377,14 @@ peer_new() {
   : >"$PEERF"
   [ "$1" = pc ] && probe_phys
   if is_locked; then p_unlocked=0; else p_unlocked=1; fi
+  p_pcfp=
+  p_pclabel=
   if [ "$1" = pc ]; then
-    peer_record "$(pc_fingerprint)"
+    _l=$(pc_fingerprint)
+    p_pcfp=${_l%%|*}
+    _l=${_l#*|}
+    p_pclabel=${_l%%|*}
+    peer_record "$p_pcfp|$p_pclabel|${_l#*|}"
   else
     _l=$(host_devices)
     # deny_new_usb stops it before it ever has an ID
@@ -338,6 +410,11 @@ peer_gone() {
   log_msg I "peer gone ($p_kind)"
   if [ "$g_armed" = 1 ] && [ "$cfg_guard_sticky" != 1 ]; then
     guard_disarm unplugged
+  fi
+  # unplugged: a per-connection "charge only" ends here
+  if [ "$cut_session" = 1 ]; then
+    cut_session=0
+    log_msg I "charge-only connection unplugged, data cut lifted"
   fi
   p_kind=none
   p_id=0
@@ -493,8 +570,10 @@ block_set() {
         sleep 1
       fi
       [ "$sid" != 0 ] && session_end quiet
-    else
+    elif [ "$cut_active" = 1 ]; then
       block_why=guard
+    else
+      block_why=charge
     fi
     kgate_set 1
     if [ -f "$RUN/kgadget.set" ]; then
@@ -531,6 +610,9 @@ block_tick() {
   elif [ "$cut_active" = 1 ]; then
     _want=1
     _why=guard
+  elif [ "$cut_session" = 1 ]; then
+    _want=1
+    _why=charge
   fi
   if [ "$_want" = 1 ] && [ "$block_why" = leftover ]; then
     block_set 1
@@ -678,8 +760,22 @@ while :; do
     udc_list
     log_msg I "rescanned: backend=$USB_BACKEND gadgets=${UDC_LIST:-none}"
   fi
+  # usbctl: "charge only" picked in the chooser / a mode picked instead
+  if [ -f "$RUN/charge_on.flag" ]; then
+    rm -f "$RUN/charge_on.flag"
+    [ "$TRUST_TC$TRUST_PS" = 00 ] && probe_phys
+    charge_only "picked in the chooser"
+  fi
+  if [ -f "$RUN/charge_off.flag" ]; then
+    rm -f "$RUN/charge_off.flag"
+    if [ "$cut_session" = 1 ]; then
+      cut_session=0
+      log_msg I "charge-only lifted, a mode was picked"
+    fi
+  fi
   if [ -f "$RUN/prompt.flag" ]; then
     rm -f "$RUN/prompt.flag"
+    s_rem=
     # user asked to see the chooser again (action button / WebUI)
     if [ "$sid" != 0 ]; then
       session_set pending
